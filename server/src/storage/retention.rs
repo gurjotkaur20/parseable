@@ -175,12 +175,12 @@ impl From<Retention> for Vec<TaskView> {
 }
 
 mod action {
-    use chrono::{Days, NaiveDate, Utc};
+    use chrono::{Days, Local, NaiveDate, NaiveDateTime, TimeZone, Utc};
     use futures::{stream::FuturesUnordered, StreamExt};
     use itertools::Itertools;
     use relative_path::RelativePathBuf;
 
-    use crate::option::CONFIG;
+    use crate::{metadata, option::CONFIG, stats};
 
     pub(super) async fn delete(stream_name: String, days: u32) {
         log::info!("running retention task - delete");
@@ -217,6 +217,46 @@ mod action {
         for res in res {
             if let Err(err) = res {
                 log::error!("Failed to run delete task {err:?}")
+            }
+        }
+
+        // update first-event-at after the cleanup
+        let first_event = stats::get_first_event_at(&stream_name).await;
+        let first_event_at = match first_event {
+            Ok(Some(value)) => Some(value.clone()),
+            Ok(None) => None,
+            Err(_err) => None,
+        };
+        if let Some(first_event_str) = first_event_at {
+            let naive_datetime =
+                NaiveDateTime::parse_from_str(&first_event_str, "%Y-%m-%dT%H:%M:%S%.3f")
+                    .expect("Failed to parse timestamp first_event_at");
+
+            let parsed_timestamp = Utc
+                .from_utc_datetime(&naive_datetime)
+                .with_timezone(&Local)
+                .format("%Y-%m-%dT%H:%M:%S%.9f%:z")
+                .to_string();
+
+            if let Err(err) = CONFIG
+                .storage()
+                .get_object_store()
+                .put_first_event_at(&stream_name, parsed_timestamp.as_str())
+                .await
+            {
+                log::error!(
+                    "Failed to update first_event_at in metadata for stream {:?} {err:?}",
+                    stream_name
+                );
+            }
+
+            if let Err(err) =
+                metadata::STREAM_INFO.set_first_event_at(&stream_name, parsed_timestamp)
+            {
+                log::error!(
+                    "Failed to update first_event_at in streaminfo for stream {:?} {err:?}",
+                    stream_name
+                );
             }
         }
     }

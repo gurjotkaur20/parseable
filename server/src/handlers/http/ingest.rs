@@ -19,6 +19,7 @@
 use actix_web::{http::header::ContentType, HttpRequest, HttpResponse};
 use arrow_schema::Field;
 use bytes::Bytes;
+use chrono::Local;
 use http::StatusCode;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
@@ -31,7 +32,8 @@ use crate::handlers::{
     LOG_SOURCE_KEY, LOG_SOURCE_KINESIS, LOG_SOURCE_OTEL, PREFIX_META, PREFIX_TAGS, SEPARATOR,
     STREAM_NAME_HEADER_KEY,
 };
-use crate::metadata::STREAM_INFO;
+use crate::metadata::{self, STREAM_INFO};
+use crate::option::CONFIG;
 use crate::utils::header_parsing::{collect_labelled_headers, ParseHeaderError};
 
 use super::kinesis;
@@ -47,7 +49,36 @@ pub async fn ingest(req: HttpRequest, body: Bytes) -> Result<HttpResponse, PostE
         .find(|&(key, _)| key == STREAM_NAME_HEADER_KEY)
     {
         let stream_name = stream_name.to_str().unwrap().to_owned();
+
+        let mut is_new_stream = true;
+        if STREAM_INFO.stream_exists(&stream_name) {
+            is_new_stream = false;
+        }
+
         create_stream_if_not_exists(&stream_name).await?;
+
+        if is_new_stream {
+            let first_event_at = Local::now().to_rfc3339();
+            if let Err(err) = CONFIG
+                .storage()
+                .get_object_store()
+                .put_first_event_at(&stream_name, first_event_at.as_str())
+                .await
+            {
+                log::error!(
+                    "Failed to update first_event_at in metadata for stream {:?} {err:?}",
+                    stream_name
+                );
+            }
+
+            if let Err(err) = metadata::STREAM_INFO.set_first_event_at(&stream_name, first_event_at)
+            {
+                log::error!(
+                    "Failed to update first_event_at in streaminfo for stream {:?} {err:?}",
+                    stream_name
+                );
+            }
+        }
 
         flatten_and_push_logs(req, body, stream_name).await?;
         Ok(HttpResponse::Ok().finish())
