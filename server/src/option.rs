@@ -27,11 +27,11 @@ use std::sync::Arc;
 use url::Url;
 
 use crate::oidc::{self, OpenidConfig};
-use crate::storage::{FSConfig, ObjectStorageProvider, S3Config};
-use crate::utils::validate_path_is_writeable;
+use crate::storage::{FSConfig, ObjectStorageError, ObjectStorageProvider, S3Config};
 
 pub const MIN_CACHE_SIZE_BYTES: u64 = 1000u64.pow(3); // 1 GiB
-
+pub const JOIN_COMMUNITY: &str =
+    "Join us on Parseable Slack community for questions : https://logg.ing/community";
 pub static CONFIG: Lazy<Arc<Config>> = Lazy::new(|| Arc::new(Config::new()));
 
 #[derive(Debug)]
@@ -99,9 +99,31 @@ impl Config {
         }
     }
 
-    pub fn validate_staging(&self) -> anyhow::Result<()> {
-        let staging_path = self.staging_dir();
-        validate_path_is_writeable(staging_path)
+    pub async fn validate(&self) -> Result<(), ObjectStorageError> {
+        let obj_store = self.storage.get_object_store();
+        let rel_path = relative_path::RelativePathBuf::from(".parseable.json");
+
+        let has_parseable_json = obj_store.get_object(&rel_path).await.is_ok();
+
+        // Lists all the directories in the root of the bucket/directory
+        // can be a stream (if it contains .stream.json file) or not
+        let has_dirs = match obj_store.list_dirs().await {
+            Ok(dirs) => !dirs.is_empty(),
+            Err(_) => false,
+        };
+
+        let has_streams = obj_store.list_streams().await.is_ok();
+
+        if has_streams || !has_dirs && !has_parseable_json {
+            return Ok(());
+        }
+
+        if self.mode_string() == "Local drive" {
+            return Err(ObjectStorageError::Custom(format!("Could not start the server because directory '{}' contains stale data, please use an empty directory, and restart the server.\n{}", self.storage.get_endpoint(), JOIN_COMMUNITY)));
+        }
+
+        // S3 bucket mode
+        Err(ObjectStorageError::Custom(format!("Could not start the server because bucket '{}' contains stale data, please use an empty bucket and restart the server.\n{}", self.storage.get_endpoint(), JOIN_COMMUNITY)))
     }
 
     pub fn storage(&self) -> Arc<dyn ObjectStorageProvider + Send + Sync> {
@@ -159,7 +181,7 @@ fn parseable_cli_command() -> Command {
         .next_line_help(false)
         .help_template(
             r#"
-{about} Join the community at https://launchpass.com/parseable.
+{about} Join the community at https://logg.ing/community.
 
 {all-args}
         "#,
